@@ -51,12 +51,13 @@ _lock  = Lock()
 
 def _merge_delta(acc: dict, delta: dict) -> None:
     """递归合并一个 delta 片段到累积 dict。
-    规则（不假设具体字段名）：
+    规则：
       - None 值跳过，不覆盖已有内容
-      - str  → 拼接（content / reasoning_content / function.arguments 等增量文本）
+      - str（增量字段）→ 拼接，仅限 content / reasoning_content / arguments
+      - str（其他字段）→ 覆盖，如 type / role / name / id 等只出现一次的字段
       - list → 按元素的 "index" 字段找到同位置条目后递归合并（tool_calls 场景）
       - dict → 递归合并（function: {name, arguments} 等嵌套结构）
-      - 其他 → 直接覆盖（role / finish_reason / logprobs 等只出现一次的字段）
+      - 其他 → 直接覆盖（finish_reason / logprobs 等）
     """
     for key, val in delta.items():
         if val is None:
@@ -64,7 +65,7 @@ def _merge_delta(acc: dict, delta: dict) -> None:
         if key not in acc or acc[key] is None:
             # 首次出现：深拷贝避免与原始 chunk 共享引用
             acc[key] = copy.deepcopy(val)
-        elif isinstance(val, str) and isinstance(acc[key], str):
+        elif isinstance(val, str) and isinstance(acc[key], str) and key in ("content", "reasoning_content", "arguments"):
             # 增量文本拼接，如 content / reasoning_content / arguments
             acc[key] += val
         elif isinstance(val, list) and isinstance(acc[key], list):

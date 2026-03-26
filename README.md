@@ -45,7 +45,7 @@ python proxy.py --upstream http://127.0.0.1:8000 --proxy-port 7654 --ui-port 765
 - [x] 消息双栏视图（Request / Response）
 - [x] 思考链（reasoning）折叠展示
 - [x] Raw JSON 视图，支持一键复制
-- [x] 侧边栏5秒局部刷新，不影响当前 tab
+- [x] 侧边栏 5 秒局部刷新，不影响当前 tab
 - [x] URL 格式 `/ids/<record_id>` 可分享
 
 ## License
@@ -61,3 +61,19 @@ llm-proxy/
 └── static/
     └── index.html    # 单文件前端
 ```
+
+## OpenAI SDK 做法
+
+关于 SSE stream 转 JSON, OpenAI Python SDK 不用通用的 _merge_delta，而是用强类型的 Pydantic 模型 + 专用 accumulate_delta 函数，按字段路径硬编码规则：
+
+```
+# openai/lib/_parsing/_completions.py 简化逻辑
+# 只有这些路径会做拼接：
+#   choice.delta.content
+#   choice.delta.tool_calls[i].function.arguments
+# 其余字段（type, id, role, name...）只在首次出现时设置，后续 chunk 不重复发送
+```
+
+关键在于：OpenAI 流式协议本身保证 type/id/role 这类字段只在首个 chunk 出现，后续 chunk 里就不会再有这些字段，所以官方 SDK 根本不用处理"重复覆盖"的问题。
+
+而第三方 OpenAI-compatible 上游返回的 SSE 流可能在每个 chunk 里都带了 type: "function"，这本身是上游行为问题，但代理需要容错处理。
