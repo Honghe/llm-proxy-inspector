@@ -96,7 +96,7 @@ body {
   padding: 4px 0;
 }
 
-#sidebar-list::-webkit-scrollbar { width: 4px; }
+#sidebar-list::-webkit-scrollbar { width: 10px; }
 #sidebar-list::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
 
 .record-item {
@@ -291,7 +291,7 @@ body {
   overflow-y: auto;
   padding: 14px;
 }
-.pane-body::-webkit-scrollbar { width: 4px; }
+.pane-body::-webkit-scrollbar { width: 10px; }
 .pane-body::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
 
 /* Code / pre */
@@ -378,6 +378,68 @@ pre, .json-pre {
   font-family: var(--sans);
 }
 .reasoning-body.open { display: block; }
+
+/* Tool calls block */
+.tool-calls-block {
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.tool-calls-toggle {
+  padding: 6px 12px;
+  background: var(--accent-bg);
+  border-bottom: 1px solid var(--accent-bd);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent);
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.tool-calls-toggle::before { content: '▶'; font-size: 8px; transition: transform .2s; }
+.tool-calls-toggle.open::before { transform: rotate(90deg); }
+.tool-calls-body {
+  display: none;
+  padding: 8px 12px;
+}
+.tool-calls-body.open { display: block; }
+.tool-call-item {
+  margin-bottom: 8px;
+  border: 1px solid var(--accent-bd);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.tool-call-item:last-child { margin-bottom: 0; }
+.tool-call-name {
+  padding: 4px 10px;
+  background: var(--accent-bg);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  border-bottom: 1px solid var(--accent-bd);
+}
+.tool-call-args {
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text);
+  background: var(--surface);
+}
+
+/* Tool result block (role=tool) */
+.tool-result-id {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text3);
+  margin-bottom: 4px;
+}
 
 /* SSE chunks raw view */
 #chunks-view {
@@ -619,7 +681,7 @@ function renderDetail(r) {
   const reqJson = r.req_json || {};
   const msgs = reqJson.messages || [];
   reqMsg.innerHTML = msgs.length
-    ? msgs.map(m => msgCard(m.role, m.content)).join('')
+    ? msgs.map(m => msgCard(m.role, m.content, null, m.tool_calls)).join('')
     : `<pre>${esc(JSON.stringify(reqJson, null, 2))}</pre>`;
 
   // ── Pretty: Response messages ──
@@ -628,14 +690,14 @@ function renderDetail(r) {
     const choices = r.resp_merged.choices || [];
     respMsg.innerHTML = choices.map(c => {
       // 泛化合并后 delta 字段直接在 choice 上，无 message 包装
-      return msgCard(c.role || 'assistant', c.content, c.reasoning_content);
+      return msgCard(c.role || 'assistant', c.content, c.reasoning_content, c.tool_calls);
     }).join('') || '<span style="color:var(--text3);font-size:12px">流式响应解析中…</span>';
   } else if (r.resp_json) {
     const choices = r.resp_json.choices || [];
     respMsg.innerHTML = choices.length
       ? choices.map(c => {
           const msg = c.message || {};
-          return msgCard(msg.role || 'assistant', msg.content, msg.reasoning_content);
+          return msgCard(msg.role || 'assistant', msg.content, msg.reasoning_content, msg.tool_calls);
         }).join('')
       : `<pre>${esc(JSON.stringify(r.resp_json, null, 2))}</pre>`;
   } else if (r.resp_raw) {
@@ -674,27 +736,67 @@ function renderDetail(r) {
 
 // ══ Helpers ════════════════════════════════════════════════════════════════
 
-function msgCard(role, content, reasoning) {
-  const dotCls = ['user','assistant','system'].includes(role) ? role : 'user';
+function msgCard(role, content, reasoning, toolCalls) {
+  const dotCls = ['user','assistant','system','tool'].includes(role) ? role : 'user';
+
+  // For role=tool, content is the tool result
+  let bodyHtml = '';
+  if (role === 'tool') {
+    // content may be array of objects or plain string
+    const parts = Array.isArray(content) ? content : null;
+    const text = parts
+      ? parts.map(p => p.text ?? JSON.stringify(p)).join('\n')
+      : (content || '');
+    bodyHtml = `<div class="msg-card-body">${esc(text)}</div>`;
+  } else if (Array.isArray(content)) {
+    // content blocks array (e.g. [{type:'text', text:'...'}, {type:'image',...}])
+    bodyHtml = content.map(block => {
+      if (block.type === 'text') return `<div class="msg-card-body">${esc(block.text || '')}</div>`;
+      return `<div class="msg-card-body" style="color:var(--text2);font-size:11px">[${esc(block.type || 'block')}]</div>`;
+    }).join('');
+  } else {
+    bodyHtml = `<div class="msg-card-body">${esc(content || '')}</div>`;
+  }
+
   let html = `
 <div class="msg-card">
   <div class="msg-card-head">
     <span class="role-dot ${dotCls}"></span>${esc(role)}
   </div>
-  <div class="msg-card-body">${esc(content || '')}</div>`;
+  ${bodyHtml}`;
 
   if (reasoning) {
     html += `
   <div class="reasoning-block">
-    <div class="reasoning-toggle" onclick="toggleReasoning(this)">思考链</div>
+    <div class="reasoning-toggle" onclick="toggleBlock(this)">思考链</div>
     <div class="reasoning-body">${esc(reasoning)}</div>
   </div>`;
   }
+
+  if (toolCalls && toolCalls.length) {
+    const itemsHtml = toolCalls.map(tc => {
+      const fn = tc.function || {};
+      const name = fn.name || tc.name || tc.id || '(unknown)';
+      let args = fn.arguments ?? tc.arguments ?? '';
+      try { args = JSON.stringify(JSON.parse(args), null, 2); } catch {}
+      return `
+    <div class="tool-call-item">
+      <div class="tool-call-name">⚙ ${esc(name)}</div>
+      <div class="tool-call-args">${esc(args)}</div>
+    </div>`;
+    }).join('');
+    html += `
+  <div class="tool-calls-block">
+    <div class="tool-calls-toggle" onclick="toggleBlock(this)">Tool Calls (${toolCalls.length})</div>
+    <div class="tool-calls-body">${itemsHtml}</div>
+  </div>`;
+  }
+
   html += '</div>';
   return html;
 }
 
-function toggleReasoning(el) {
+function toggleBlock(el) {
   el.classList.toggle('open');
   el.nextElementSibling.classList.toggle('open');
 }
