@@ -307,6 +307,14 @@ def api_records():
     return result
 
 
+@ui_app.delete("/api/records")
+def api_clear_records():
+    """清除所有历史记录。使用 _lock 保证与写入互斥。"""
+    with _lock:
+        _store.clear()
+    return {"cleared": True}
+
+
 @ui_app.get("/api/records/{record_id}")
 def api_record_detail(record_id: str):
     """单条记录完整数据。"""

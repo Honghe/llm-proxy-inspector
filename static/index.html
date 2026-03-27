@@ -472,6 +472,21 @@ pre, .json-pre {
 #empty .big { font-size: 28px; }
 #empty p { font-size: 13px; }
 
+/* Clear button */
+#clear-btn {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border: 1px solid var(--border2);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text3);
+  cursor: pointer;
+  font-family: var(--sans);
+}
+#clear-btn:hover { background: var(--red-bg); color: var(--red); border-color: #e8b4b0; }
+
 /* Copy button */
 .copy-btn {
   margin-left: auto;
@@ -497,6 +512,7 @@ pre, .json-pre {
     <div id="sidebar-meta">
       <span id="count-badge">0 条记录</span>
       <span id="upstream-badge"></span>
+      <button id="clear-btn" onclick="clearHistory()">清除</button>
     </div>
   </div>
   <div id="sidebar-list">
@@ -851,6 +867,19 @@ function copyPaneJson(side, btn) {
     ? currentRecord.req_json
     : (currentRecord.is_sse ? currentRecord.resp_merged : currentRecord.resp_json);
   copyText(JSON.stringify(data, null, 2), btn);
+}
+
+// ══ Clear history ═════════════════════════════════════════════════════════
+async function clearHistory() {
+  try {
+    await fetch('/api/records', { method: 'DELETE' });
+  } catch { return; }
+  currentId = null;
+  currentRecord = null;
+  history.replaceState(null, '', '/');
+  document.getElementById('empty').style.display = 'flex';
+  document.getElementById('detail').style.display = 'none';
+  await refreshSidebar();
 }
 
 // ══ Boot ══════════════════════════════════════════════════════════════════
