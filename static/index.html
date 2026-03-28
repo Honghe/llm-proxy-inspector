@@ -201,6 +201,15 @@ body {
   padding: 2px 7px;
   border-radius: 4px;
 }
+.usage-badge {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text2);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  padding: 2px 7px;
+  border-radius: 4px;
+}
 .stream-badge {
   font-size: 9.5px;
   font-weight: 600;
@@ -521,6 +530,7 @@ pre {
       <span id="toolbar-path">—</span>
       <span id="toolbar-model" style="display:none"></span>
       <span id="toolbar-latency" class="latency-badge" style="display:none"></span>
+      <span id="toolbar-usage" class="usage-badge" style="display:none"></span>
       <span id="toolbar-stream" class="stream-badge" style="display:none">SSE Stream</span>
     </div>
 
@@ -561,6 +571,15 @@ let currentSessionId = null;
 let currentSession = null;
 let currentRecord = null;
 let sessions = [];
+
+function currentSessionNeedsRefresh() {
+  if (!currentSessionId) return false;
+
+  const activeSession = sessions.find(s => s.id === currentSessionId);
+  if (activeSession) return !activeSession.done;
+
+  return !(currentSession && currentSession.session && currentSession.session.done);
+}
 
 function routeFromUrl() {
   let m = location.pathname.match(/^\/sessions\/(.+)/);
@@ -667,6 +686,15 @@ function renderDetail(payload) {
     latEl.style.display = 'none';
   }
 
+  const usageEl = document.getElementById('toolbar-usage');
+  const usageText = last ? formatUsage(getUsage(last)) : '';
+  if (usageText) {
+    usageEl.textContent = usageText;
+    usageEl.style.display = '';
+  } else {
+    usageEl.style.display = 'none';
+  }
+
   const hasSse = records.some(r => r.is_sse);
   document.getElementById('toolbar-stream').style.display = hasSse ? '' : 'none';
   document.getElementById('tab-chunks').style.display = hasSse ? '' : 'none';
@@ -694,13 +722,14 @@ function renderTurn(record, turnIndex) {
     record.status == null ? 'pending' : String(record.status),
     record.latency != null ? record.latency + 'ms' : null,
   ].filter(Boolean);
+  const usageText = formatUsage(getUsage(record));
 
   return `
 <div class="turn-card">
   <div class="turn-head">
     <span class="turn-index">#${turnIndex}</span>
     <span>${esc(record.path)}</span>
-    <span class="turn-meta">${esc(parts.join(' · '))}</span>
+    <span class="turn-meta">${esc(parts.join(' · '))}${usageText ? ' · ' + esc(usageText) : ''}</span>
   </div>
   <div class="turn-split">
     <div class="turn-pane">
@@ -713,6 +742,33 @@ function renderTurn(record, turnIndex) {
     </div>
   </div>
 </div>`;
+}
+
+function getUsage(record) {
+  const payload = (record && (record.resp_merged || record.resp_json)) || null;
+  if (!payload || typeof payload !== 'object') return null;
+  const usage = payload.usage;
+  return usage && typeof usage === 'object' ? usage : null;
+}
+
+function formatUsage(usage) {
+  if (!usage) return '';
+
+  const input = usage.input_tokens ?? usage.prompt_tokens ?? usage.prompt_token_count ?? null;
+  const output = usage.output_tokens ?? usage.completion_tokens ?? usage.output_token_count ?? null;
+  const total = usage.total_tokens ?? usage.total_token_count ?? (
+    Number.isFinite(input) && Number.isFinite(output) ? input + output : null
+  );
+
+  const parts = [];
+  if (Number.isFinite(input)) parts.push(`in ${formatNumber(input)}`);
+  if (Number.isFinite(output)) parts.push(`out ${formatNumber(output)}`);
+  if (Number.isFinite(total)) parts.push(`total ${formatNumber(total)}`);
+  return parts.join(' · ');
+}
+
+function formatNumber(value) {
+  return new Intl.NumberFormat('en-US').format(value);
 }
 
 function renderResponse(record) {
@@ -944,7 +1000,9 @@ async function clearHistory() {
   if (sessionId) await selectSession(sessionId);
   setInterval(async () => {
     await refreshSidebar();
-    await refreshCurrentSession();
+    if (currentSessionNeedsRefresh()) {
+      await refreshCurrentSession();
+    }
   }, 5000);
 })();
 </script>
