@@ -10,15 +10,16 @@ LLM Proxy — OpenAI-compatible reverse proxy with request/response inspector
 import argparse
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import os
+import sqlite3
 import time
 import uuid
-from collections import OrderedDict
 from datetime import datetime
-from threading import Lock
-from typing import AsyncIterator
+from pathlib import Path
+from typing import Any, AsyncIterator
 
 import httpx
 import uvicorn
@@ -28,79 +29,118 @@ from fastapi.staticfiles import StaticFiles
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 _parser = argparse.ArgumentParser(description="LLM Proxy Inspector")
-_parser.add_argument("--upstream",    default=os.getenv("UPSTREAM_BASE", "http://127.0.0.1:8000"))
-_parser.add_argument("--proxy-port",  type=int, default=int(os.getenv("PROXY_PORT", "7654")))
-_parser.add_argument("--ui-port",     type=int, default=int(os.getenv("UI_PORT",    "7655")))
-_parser.add_argument("--max-records", type=int, default=int(os.getenv("MAX_RECORDS","200")))
+_parser.add_argument("--upstream", default=os.getenv("UPSTREAM_BASE", "http://127.0.0.1:8000"))
+_parser.add_argument("--proxy-port", type=int, default=int(os.getenv("PROXY_PORT", "7654")))
+_parser.add_argument("--ui-port", type=int, default=int(os.getenv("UI_PORT", "7655")))
+_parser.add_argument("--max-records", type=int, default=int(os.getenv("MAX_RECORDS", "200")))
+_parser.add_argument("--db-path", default=os.getenv("DB_PATH", "data/proxy.db"))
 _args = _parser.parse_args()
 
 UPSTREAM_BASE = _args.upstream.rstrip("/")
-PROXY_PORT    = _args.proxy_port
-UI_PORT       = _args.ui_port
-MAX_RECORDS   = _args.max_records
+PROXY_PORT = _args.proxy_port
+UI_PORT = _args.ui_port
+MAX_RECORDS = _args.max_records
+DB_PATH = Path(_args.db_path)
 # ──────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("proxy")
 
-_store: OrderedDict[str, dict] = OrderedDict()
-_lock  = Lock()
+
+def db_connect() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+DB = db_connect()
+
+
+def init_db() -> None:
+    DB.execute(
+        """
+        CREATE TABLE IF NOT EXISTS records (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            time TEXT NOT NULL,
+            method TEXT NOT NULL,
+            path TEXT NOT NULL,
+            model TEXT,
+            stream INTEGER NOT NULL DEFAULT 0,
+            status INTEGER,
+            latency INTEGER,
+            is_sse INTEGER NOT NULL DEFAULT 0,
+            req_json TEXT,
+            resp_json TEXT,
+            resp_merged TEXT,
+            resp_raw TEXT,
+            sse_lines TEXT,
+            req_messages_sig TEXT,
+            req_messages_count INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    DB.execute("CREATE INDEX IF NOT EXISTS idx_records_session_created ON records(session_id, created_at)")
+    DB.execute("CREATE INDEX IF NOT EXISTS idx_records_created ON records(created_at)")
+    DB.commit()
+
+
+init_db()
+
+
+def dumps_json(value: Any) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False)
+
+
+def loads_json(value: str | None) -> Any:
+    if not value:
+        return None
+    return json.loads(value)
 
 
 # ── SSE 解析 ──────────────────────────────────────────────────────────────────
 
 def _merge_delta(acc: dict, delta: dict) -> None:
-    """递归合并一个 delta 片段到累积 dict。
-    规则：
-      - None 值跳过，不覆盖已有内容
-      - str（增量字段）→ 拼接，仅限 content / reasoning_content / arguments
-      - str（其他字段）→ 覆盖，如 type / role / name / id 等只出现一次的字段
-      - list → 按元素的 "index" 字段找到同位置条目后递归合并（tool_calls 场景）
-      - dict → 递归合并（function: {name, arguments} 等嵌套结构）
-      - 其他 → 直接覆盖（finish_reason / logprobs 等）
-    """
     for key, val in delta.items():
         if val is None:
             continue
         if key not in acc or acc[key] is None:
-            # 首次出现：深拷贝避免与原始 chunk 共享引用
             acc[key] = copy.deepcopy(val)
         elif isinstance(val, str) and isinstance(acc[key], str) and key in ("content", "reasoning_content", "arguments"):
-            # 增量文本拼接，如 content / reasoning_content / arguments
             acc[key] += val
         elif isinstance(val, list) and isinstance(acc[key], list):
-            # 列表元素按 "index" 字段定位后递归合并
-            # 典型场景：tool_calls，每个 chunk 携带部分 arguments
             for item in val:
                 if not isinstance(item, dict):
                     acc[key].append(item)
                     continue
                 item_idx = item.get("index")
-                existing = next(
-                    (x for x in acc[key] if isinstance(x, dict) and x.get("index") == item_idx),
-                    None,
-                ) if item_idx is not None else None
+                existing = (
+                    next((x for x in acc[key] if isinstance(x, dict) and x.get("index") == item_idx), None)
+                    if item_idx is not None
+                    else None
+                )
                 if existing is None:
-                    # 新的 tool_call 条目，首次出现
                     acc[key].append(copy.deepcopy(item))
                 else:
                     _merge_delta(existing, item)
         elif isinstance(val, dict) and isinstance(acc[key], dict):
-            # 嵌套 dict 递归合并，如 function: {name, arguments}
             _merge_delta(acc[key], val)
         else:
-            # 覆盖：role 等只出现一次的字段，或类型与首次不同时（上游异常场景）
             if type(acc[key]) is not type(val):
-                log.warning("merge type mismatch key=%r acc=%r val=%r, overwriting", key, type(acc[key]).__name__, type(val).__name__)
+                log.warning(
+                    "merge type mismatch key=%r acc=%r val=%r, overwriting",
+                    key,
+                    type(acc[key]).__name__,
+                    type(val).__name__,
+                )
             acc[key] = val
 
 
 def parse_sse_lines(lines: list[str]) -> dict:
-    """将原始 SSE 行列表合并为类非流式响应结构。
-
-    只对 choices（按 index）和 usage 做特殊处理，
-    delta 内部字段全部交给 _merge_delta 泛化处理。
-    """
     chunks: list[dict] = []
     for line in lines:
         line = line.strip()
@@ -117,20 +157,17 @@ def parse_sse_lines(lines: list[str]) -> dict:
     if not chunks:
         return {}
 
-    # 顶层元数据取第一个 chunk
     first = chunks[0]
     result: dict = {
-        "id":      first.get("id"),
-        "object":  "chat.completion",
+        "id": first.get("id"),
+        "object": "chat.completion",
         "created": first.get("created"),
-        "model":   first.get("model"),
-        "usage":   None,
+        "model": first.get("model"),
+        "usage": None,
     }
 
-    # key: choice index，value: 累积合并后的 choice dict
     choices_acc: dict[int, dict] = {}
     for chunk in chunks:
-        # usage 通常只在最后一个 chunk 出现（需请求时开启 stream_options）
         if chunk.get("usage"):
             result["usage"] = chunk["usage"]
 
@@ -138,10 +175,7 @@ def parse_sse_lines(lines: list[str]) -> dict:
             idx = choice.get("index", 0)
             if idx not in choices_acc:
                 choices_acc[idx] = {"index": idx, "finish_reason": None}
-            # delta 内容泛化合并，不假设具体字段
             _merge_delta(choices_acc[idx], choice.get("delta", {}))
-            # choice 顶层字段（finish_reason / logprobs / matched_stop 等）
-            # 不假设有哪些，跳过 delta 和 index 之外全部合并
             top = {k: v for k, v in choice.items() if k not in ("delta", "index") and v is not None}
             _merge_delta(choices_acc[idx], top)
 
@@ -149,11 +183,237 @@ def parse_sse_lines(lines: list[str]) -> dict:
     return result
 
 
-def _save(record_id: str, data: dict):
-    with _lock:
-        _store[record_id] = data
-        while len(_store) > MAX_RECORDS:
-            _store.popitem(last=False)
+def get_messages(req_json: Any) -> list[dict]:
+    if isinstance(req_json, dict) and isinstance(req_json.get("messages"), list):
+        return [m for m in req_json["messages"] if isinstance(m, dict)]
+    return []
+
+
+def _session_hint(req_json: Any, headers: dict[str, str]) -> str | None:
+    lowered = {k.lower(): v for k, v in headers.items()}
+    for key in ("x-session-id", "x-conversation-id", "x-thread-id"):
+        if lowered.get(key):
+            return lowered[key]
+
+    if not isinstance(req_json, dict):
+        return None
+
+    for key in ("session_id", "conversation_id", "thread_id"):
+        value = req_json.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    metadata = req_json.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("session_id", "conversation_id", "thread_id"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _messages_sig(messages: list[dict]) -> str | None:
+    if not messages:
+        return None
+    encoded = json.dumps(messages, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+
+
+def _is_prefix_messages(previous: list[dict], current: list[dict]) -> bool:
+    if not previous or len(previous) > len(current):
+        return False
+    return previous == current[: len(previous)]
+
+
+def resolve_session_id(path: str, model: str, req_json: Any, headers: dict[str, str]) -> tuple[str, str | None, int]:
+    hinted = _session_hint(req_json, headers)
+    messages = get_messages(req_json)
+    messages_count = len(messages)
+    messages_sig = _messages_sig(messages)
+
+    if hinted:
+        return hinted, messages_sig, messages_count
+
+    if messages:
+        rows = DB.execute(
+            """
+            SELECT session_id, req_json
+            FROM records
+            WHERE path = ? AND model = ?
+            ORDER BY created_at DESC
+            LIMIT 50
+            """,
+            (path, model),
+        ).fetchall()
+        for row in rows:
+            prev_json = loads_json(row["req_json"])
+            prev_messages = get_messages(prev_json)
+            if _is_prefix_messages(prev_messages, messages) or prev_messages == messages:
+                return row["session_id"], messages_sig, messages_count
+
+    return str(uuid.uuid4()), messages_sig, messages_count
+
+
+def save_record(data: dict[str, Any]) -> None:
+    DB.execute(
+        """
+        INSERT OR REPLACE INTO records (
+            id, session_id, created_at, time, method, path, model, stream, status, latency, is_sse,
+            req_json, resp_json, resp_merged, resp_raw, sse_lines, req_messages_sig, req_messages_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            data["id"],
+            data["session_id"],
+            data["created_at"],
+            data["time"],
+            data["method"],
+            data["path"],
+            data.get("model"),
+            int(bool(data.get("stream"))),
+            data.get("status"),
+            data.get("latency"),
+            int(bool(data.get("is_sse"))),
+            dumps_json(data.get("req_json")),
+            dumps_json(data.get("resp_json")),
+            dumps_json(data.get("resp_merged")),
+            data.get("resp_raw"),
+            dumps_json(data.get("sse_lines")),
+            data.get("req_messages_sig"),
+            data.get("req_messages_count", 0),
+        ),
+    )
+    DB.commit()
+
+    DB.execute(
+        """
+        DELETE FROM records
+        WHERE id IN (
+            SELECT id
+            FROM records
+            ORDER BY created_at DESC
+            LIMIT -1 OFFSET ?
+        )
+        """,
+        (MAX_RECORDS,),
+    )
+    DB.commit()
+
+
+def update_record(record_id: str, **updates: Any) -> None:
+    current = get_record(record_id)
+    if not current:
+        return
+    current.update(updates)
+    save_record(current)
+
+
+def row_to_record(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "created_at": row["created_at"],
+        "time": row["time"],
+        "method": row["method"],
+        "path": row["path"],
+        "model": row["model"] or "",
+        "stream": bool(row["stream"]),
+        "status": row["status"],
+        "latency": row["latency"],
+        "is_sse": bool(row["is_sse"]),
+        "req_json": loads_json(row["req_json"]),
+        "resp_json": loads_json(row["resp_json"]),
+        "resp_merged": loads_json(row["resp_merged"]),
+        "resp_raw": row["resp_raw"],
+        "sse_lines": loads_json(row["sse_lines"]),
+        "req_messages_sig": row["req_messages_sig"],
+        "req_messages_count": row["req_messages_count"],
+    }
+
+
+def get_record(record_id: str) -> dict[str, Any] | None:
+    row = DB.execute("SELECT * FROM records WHERE id = ?", (record_id,)).fetchone()
+    return row_to_record(row)
+
+
+def get_session_records(session_id: str) -> list[dict[str, Any]]:
+    rows = DB.execute(
+        "SELECT * FROM records WHERE session_id = ? ORDER BY created_at ASC",
+        (session_id,),
+    ).fetchall()
+    records = []
+    for row in rows:
+        record = row_to_record(row)
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def summarize_record(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": record["id"],
+        "session_id": record["session_id"],
+        "time": record["time"],
+        "method": record["method"],
+        "path": record["path"],
+        "model": record.get("model", ""),
+        "stream": record.get("stream", False),
+        "status": record.get("status"),
+        "latency": record.get("latency"),
+        "is_sse": record.get("is_sse", False),
+        "done": record.get("status") is not None,
+    }
+
+
+def summarize_session(records: list[dict[str, Any]]) -> dict[str, Any]:
+    first = records[0]
+    last = records[-1]
+    return {
+        "id": first["session_id"],
+        "created_at": first["created_at"],
+        "last_created_at": last["created_at"],
+        "record_count": len(records),
+        "time": first["time"],
+        "last_time": last["time"],
+        "method": last["method"],
+        "path": last["path"],
+        "model": last.get("model", ""),
+        "status": last.get("status"),
+        "latency": last.get("latency"),
+        "is_sse": any(r.get("is_sse") for r in records),
+        "done": all(r.get("status") is not None for r in records),
+        "last_record_id": last["id"],
+        "preview": build_session_preview(records),
+    }
+
+
+def build_session_preview(records: list[dict[str, Any]]) -> str:
+    for record in reversed(records):
+        messages = get_messages(record.get("req_json"))
+        if messages:
+            last = messages[-1]
+            content = last.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()[:120]
+            if isinstance(content, list):
+                text_parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
+                joined = " ".join(part for part in text_parts if part).strip()
+                if joined:
+                    return joined[:120]
+    return ""
+
+
+def list_sessions() -> list[dict[str, Any]]:
+    rows = DB.execute("SELECT DISTINCT session_id FROM records").fetchall()
+    sessions = []
+    for row in rows:
+        records = get_session_records(row["session_id"])
+        if records:
+            sessions.append(summarize_session(records))
+    sessions.sort(key=lambda item: item["last_created_at"], reverse=True)
+    return sessions
 
 
 # ── Proxy App ─────────────────────────────────────────────────────────────────
@@ -161,13 +421,10 @@ def _save(record_id: str, data: dict):
 proxy_app = FastAPI(title="LLM Proxy")
 
 
-@proxy_app.api_route("/{path:path}", methods=["GET","POST","PUT","DELETE","PATCH","OPTIONS"])
+@proxy_app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy(path: str, request: Request):
     url = f"{UPSTREAM_BASE}/{path}"
-    headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length")
-    }
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
 
     body_bytes = await request.body()
     try:
@@ -177,32 +434,33 @@ async def proxy(path: str, request: Request):
 
     is_stream = isinstance(req_json, dict) and req_json.get("stream", False)
     record_id = str(uuid.uuid4())
-    ts = datetime.now().strftime("%H:%M:%S")
-    model = req_json.get("model", "") if req_json else ""
-
-    # 基础记录（先存，流结束后补充）
+    session_id, req_messages_sig, req_messages_count = resolve_session_id(f"/{path}", req_json.get("model", "") if isinstance(req_json, dict) else "", req_json, headers)
+    now = datetime.now()
     base_record = {
-        "id":       record_id,
-        "time":     ts,
-        "method":   request.method,
-        "path":     f"/{path}",
-        "model":    model,
-        "stream":   is_stream,
+        "id": record_id,
+        "session_id": session_id,
+        "created_at": int(now.timestamp() * 1000),
+        "time": now.strftime("%H:%M:%S"),
+        "method": request.method,
+        "path": f"/{path}",
+        "model": req_json.get("model", "") if isinstance(req_json, dict) else "",
+        "stream": is_stream,
         "req_json": req_json,
-        "status":   None,
-        "latency":  None,
-        "is_sse":   False,
-        "resp_json":   None,   # 非流式
-        "resp_merged": None,   # 流式合并后
-        "resp_raw":    None,   # 原始文本（非流式）
-        "sse_lines":   None,   # 原始 SSE 行
+        "status": None,
+        "latency": None,
+        "is_sse": False,
+        "resp_json": None,
+        "resp_merged": None,
+        "resp_raw": None,
+        "sse_lines": None,
+        "req_messages_sig": req_messages_sig,
+        "req_messages_count": req_messages_count,
     }
-    _save(record_id, base_record)
+    save_record(base_record)
 
     t0 = time.monotonic()
-    log.info("→ %s %s  model=%s  stream=%s", request.method, url, model or "-", is_stream)
+    log.info("→ %s %s  model=%s  stream=%s  session=%s", request.method, url, base_record["model"] or "-", is_stream, session_id[:8])
 
-    # ── 流式 ──────────────────────────────────────────────
     if is_stream:
         async def stream_gen() -> AsyncIterator[bytes]:
             sse_lines: list[str] = []
@@ -210,8 +468,10 @@ async def proxy(path: str, request: Request):
             async with httpx.AsyncClient(timeout=300) as stream_client:
                 try:
                     async with stream_client.stream(
-                        request.method, url,
-                        headers=headers, content=body_bytes
+                        request.method,
+                        url,
+                        headers=headers,
+                        content=body_bytes,
                     ) as upstream:
                         status_code = upstream.status_code
                         log.info("← %s %s  status=%s  [SSE started]", request.method, url, status_code)
@@ -224,31 +484,35 @@ async def proxy(path: str, request: Request):
                 finally:
                     latency = round((time.monotonic() - t0) * 1000)
                     merged = parse_sse_lines(sse_lines)
-                    log.info("← %s %s  status=%s  %dms  [SSE done, chunks=%d]",
-                             request.method, url, status_code, latency, len(sse_lines))
-                    with _lock:
-                        if record_id in _store:
-                            _store[record_id].update({
-                                "status":      status_code,
-                                "latency":     latency,
-                                "is_sse":      True,
-                                "resp_merged": merged,
-                                "sse_lines":   sse_lines,
-                            })
+                    log.info(
+                        "← %s %s  status=%s  %dms  [SSE done, chunks=%d]",
+                        request.method,
+                        url,
+                        status_code,
+                        latency,
+                        len(sse_lines),
+                    )
+                    update_record(
+                        record_id,
+                        status=status_code,
+                        latency=latency,
+                        is_sse=True,
+                        resp_merged=merged,
+                        sse_lines=sse_lines,
+                    )
 
         return StreamingResponse(
             stream_gen(),
             media_type="text/event-stream",
-            headers={"X-Proxy-Record-Id": record_id},
+            headers={
+                "X-Proxy-Record-Id": record_id,
+                "X-Proxy-Session-Id": session_id,
+            },
         )
 
-    # ── 非流式 ────────────────────────────────────────────
     async with httpx.AsyncClient(timeout=300) as client:
         try:
-            resp = await client.request(
-                request.method, url,
-                headers=headers, content=body_bytes
-            )
+            resp = await client.request(request.method, url, headers=headers, content=body_bytes)
         except Exception as exc:
             log.error("✗ %s %s  error=%s", request.method, url, exc)
             raise
@@ -259,15 +523,14 @@ async def proxy(path: str, request: Request):
         except Exception:
             resp_json = None
 
-        with _lock:
-            if record_id in _store:
-                _store[record_id].update({
-                    "status":   resp.status_code,
-                    "latency":  latency,
-                    "is_sse":   False,
-                    "resp_json": resp_json,
-                    "resp_raw":  resp.text if resp_json is None else None,
-                })
+        update_record(
+            record_id,
+            status=resp.status_code,
+            latency=latency,
+            is_sse=False,
+            resp_json=resp_json,
+            resp_raw=resp.text if resp_json is None else None,
+        )
 
         return Response(
             content=resp.content,
@@ -275,6 +538,7 @@ async def proxy(path: str, request: Request):
             headers={
                 **dict(resp.headers),
                 "X-Proxy-Record-Id": record_id,
+                "X-Proxy-Session-Id": session_id,
             },
             media_type=resp.headers.get("content-type"),
         )
@@ -287,63 +551,58 @@ ui_app = FastAPI(title="LLM Proxy UI")
 
 @ui_app.get("/api/records")
 def api_records():
-    """侧边栏列表，轻量数据。"""
-    with _lock:
-        items = list(_store.values())
-    result = []
-    for r in reversed(items):
-        result.append({
-            "id":      r["id"],
-            "time":    r["time"],
-            "method":  r["method"],
-            "path":    r["path"],
-            "model":   r.get("model", ""),
-            "stream":  r.get("stream", False),
-            "status":  r.get("status"),
-            "latency": r.get("latency"),
-            "is_sse":  r.get("is_sse", False),
-            "done":    r.get("status") is not None,
-        })
-    return result
+    rows = DB.execute("SELECT * FROM records ORDER BY created_at DESC").fetchall()
+    return [summarize_record(row_to_record(row)) for row in rows]
+
+
+@ui_app.get("/api/sessions")
+def api_sessions():
+    return list_sessions()
+
+
+@ui_app.get("/api/sessions/{session_id}")
+def api_session_detail(session_id: str):
+    records = get_session_records(session_id)
+    if not records:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return {
+        "session": summarize_session(records),
+        "records": records,
+    }
 
 
 @ui_app.delete("/api/records")
 def api_clear_records():
-    """清除所有历史记录。使用 _lock 保证与写入互斥。"""
-    with _lock:
-        _store.clear()
+    DB.execute("DELETE FROM records")
+    DB.commit()
     return {"cleared": True}
 
 
 @ui_app.get("/api/records/{record_id}")
 def api_record_detail(record_id: str):
-    """单条记录完整数据。"""
-    with _lock:
-        r = _store.get(record_id)
-    if not r:
+    record = get_record(record_id)
+    if not record:
         return JSONResponse({"error": "not found"}, status_code=404)
-    return r
+    return record
 
 
 @ui_app.get("/ids/{record_id}")
+@ui_app.get("/sessions/{session_id}")
 @ui_app.get("/")
 def index():
     return FileResponse("static/index.html")
 
 
-# ── 静态文件 ──────────────────────────────────────────────────────────────────
-
 ui_app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
-# ── 启动两个服务 ──────────────────────────────────────────────────────────────
-
 async def main():
     cfg_proxy = uvicorn.Config(proxy_app, host="0.0.0.0", port=PROXY_PORT, log_level="warning")
-    cfg_ui    = uvicorn.Config(ui_app,    host="0.0.0.0", port=UI_PORT,    log_level="warning")
+    cfg_ui = uvicorn.Config(ui_app, host="0.0.0.0", port=UI_PORT, log_level="warning")
 
-    print(f"  🔀  Proxy  → http://0.0.0.0:{PROXY_PORT}  (upstream: {UPSTREAM_BASE})")
-    print(f"  🔍  UI     → http://0.0.0.0:{UI_PORT}")
+    print(f"  Proxy  -> http://0.0.0.0:{PROXY_PORT}  (upstream: {UPSTREAM_BASE})")
+    print(f"  UI     -> http://0.0.0.0:{UI_PORT}")
+    print(f"  DB     -> {DB_PATH}")
     print()
 
     await asyncio.gather(

@@ -16,12 +16,27 @@ python proxy.py
 
 # 自定义
 python proxy.py --upstream http://127.0.0.1:8000 --proxy-port 7654 --ui-port 7655
+
+# 指定 sqlite 数据文件
+python proxy.py --db-path data/proxy.db
 ```
+
+## Docker Compose
+
+```bash
+docker compose up --build
+```
+
+- 默认上游是 `http://host.docker.internal:8080`
+- 如需改成别的上游，修改 [docker-compose.yml](/Users/liubaoyuan/VibeProjects/llm-proxy-inspector/docker-compose.yml) 里的 `UPSTREAM_BASE`
+- sqlite 数据会持久化到宿主机的 `./data/proxy.db`
 
 ## 使用
 
 - 客户端将 API 地址指向 `http://<your-host>:7654`
 - 浏览器打开 `http://<your-host>:7655` 查看请求/响应
+- UI 会自动把连续对话归并成一个 session，按时间线查看每一轮请求/响应
+- 支持显式透传 `x-session-id` / `x-conversation-id` / `x-thread-id` 来强制归组
 
 ## 截图
 
@@ -49,6 +64,8 @@ python proxy.py --upstream http://127.0.0.1:8000 --proxy-port 7654 --ui-port 765
 - [x] 工具调用（tool call）折叠展示
 - [x] 侧边栏 5 秒局部刷新，不影响当前 tab
 - [x] URL 格式 `/ids/<record_id>` 可分享
+- [x] sqlite 持久化，重启后历史不丢
+- [x] 会话视图，连续对话按 session 聚合展示
 
 ## License
 
