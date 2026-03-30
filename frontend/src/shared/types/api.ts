@@ -17,6 +17,7 @@ export interface SessionSummary {
   last_time: string;
   method: string;
   path: string;
+  client_ip?: string;
   model?: string;
   status?: number | null;
   latency?: number | null;
@@ -50,6 +51,7 @@ export interface RecordItem {
   time: string;
   method: string;
   path: string;
+  client_ip?: string;
   model?: string;
   stream?: boolean;
   status?: number | null;

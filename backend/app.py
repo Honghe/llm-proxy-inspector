@@ -66,6 +66,7 @@ def init_db() -> None:
             time TEXT NOT NULL,
             method TEXT NOT NULL,
             path TEXT NOT NULL,
+            client_ip TEXT,
             model TEXT,
             stream INTEGER NOT NULL DEFAULT 0,
             status INTEGER,
@@ -81,6 +82,9 @@ def init_db() -> None:
         )
         """
     )
+    columns = {row["name"] for row in DB.execute("PRAGMA table_info(records)").fetchall()}
+    if "client_ip" not in columns:
+        DB.execute("ALTER TABLE records ADD COLUMN client_ip TEXT")
     DB.execute("CREATE INDEX IF NOT EXISTS idx_records_session_created ON records(session_id, created_at)")
     DB.execute("CREATE INDEX IF NOT EXISTS idx_records_created ON records(created_at)")
     DB.commit()
@@ -465,9 +469,9 @@ def save_record(data: dict[str, Any]) -> None:
     DB.execute(
         """
         INSERT OR REPLACE INTO records (
-            id, session_id, created_at, time, method, path, model, stream, status, latency, is_sse,
+            id, session_id, created_at, time, method, path, client_ip, model, stream, status, latency, is_sse,
             req_json, resp_json, resp_merged, resp_raw, sse_lines, req_messages_sig, req_messages_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             data["id"],
@@ -476,6 +480,7 @@ def save_record(data: dict[str, Any]) -> None:
             data["time"],
             data["method"],
             data["path"],
+            data.get("client_ip"),
             data.get("model"),
             int(bool(data.get("stream"))),
             data.get("status"),
@@ -525,6 +530,7 @@ def row_to_record(row: sqlite3.Row | None) -> dict[str, Any] | None:
         "time": row["time"],
         "method": row["method"],
         "path": row["path"],
+        "client_ip": row["client_ip"] or "",
         "model": row["model"] or "",
         "stream": bool(row["stream"]),
         "status": row["status"],
@@ -565,6 +571,7 @@ def summarize_record(record: dict[str, Any]) -> dict[str, Any]:
         "time": record["time"],
         "method": record["method"],
         "path": record["path"],
+        "client_ip": record.get("client_ip", ""),
         "model": record.get("model", ""),
         "stream": record.get("stream", False),
         "status": record.get("status"),
@@ -602,6 +609,7 @@ def summarize_session(records: list[dict[str, Any]]) -> dict[str, Any]:
         "last_time": last["time"],
         "method": last["method"],
         "path": last["path"],
+        "client_ip": last.get("client_ip", ""),
         "model": last.get("model", ""),
         "status": last.get("status"),
         "latency": last.get("latency"),
@@ -680,6 +688,12 @@ def api_record_detail(record_id: str):
 async def proxy(path: str, request: Request):
     url = f"{UPSTREAM_BASE}/{path}"
     headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    client_ip = (
+        forwarded_for.split(",")[0].strip()
+        or request.headers.get("x-real-ip", "").strip()
+        or (request.client.host if request.client else "")
+    )
 
     body_bytes = await request.body()
     try:
@@ -703,6 +717,7 @@ async def proxy(path: str, request: Request):
         "time": now.strftime("%H:%M:%S"),
         "method": request.method,
         "path": f"/{path}",
+        "client_ip": client_ip,
         "model": req_json.get("model", "") if isinstance(req_json, dict) else "",
         "stream": is_stream,
         "req_json": req_json,

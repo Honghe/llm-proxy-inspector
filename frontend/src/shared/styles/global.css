@@ -100,6 +100,53 @@ button {
   align-items: center;
 }
 
+.sidebar-filters {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sidebar-filter-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.sidebar-filter-input,
+.sidebar-filter-select {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  padding: 8px 10px;
+  font-size: 11.5px;
+  outline: none;
+}
+
+.sidebar-filter-input:focus,
+.sidebar-filter-select:focus {
+  border-color: var(--accent-bd);
+  box-shadow: 0 0 0 3px rgba(42, 91, 215, 0.08);
+}
+
+.sidebar-filter-clear {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text2);
+  padding: 8px 10px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.sidebar-filter-clear:hover {
+  background: var(--bg);
+  color: var(--text);
+}
+
 #sidebar-list {
   flex: 1;
   overflow-y: auto;
