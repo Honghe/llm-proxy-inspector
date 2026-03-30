@@ -9,14 +9,20 @@ type TabKey = "pretty" | "raw-json" | "chunks";
 
 interface SessionDetailProps {
   payload: SessionDetailData;
+  selectedRecordId?: string;
 }
 
-export function SessionDetail({ payload }: SessionDetailProps) {
+export function SessionDetail({ payload, selectedRecordId }: SessionDetailProps) {
   const [activeTab, setActiveTab] = useState<TabKey>("pretty");
 
   const records = payload.records || [];
   const session = payload.session;
   const last = records[records.length - 1] || null;
+  const visibleRecords = selectedRecordId
+    ? records.filter((record) => record.id === selectedRecordId)
+    : last
+      ? [last]
+      : [];
   const hasSse = records.some((record) => record.is_sse);
   const usageText = formatUsage(getRecordUsage(last));
 
@@ -58,8 +64,13 @@ export function SessionDetail({ payload }: SessionDetailProps) {
         {visibleTab === "pretty" ? (
           <div id="panel-pretty" className="panel active">
             <div id="session-turns" className="turn-list">
-              {records.map((record, index) => (
-                <TurnCard key={record.id} record={record} turnIndex={index + 1} />
+              {visibleRecords.map((record) => (
+                <TurnCard
+                  key={record.id}
+                  record={record}
+                  turnIndex={records.findIndex((item) => item.id === record.id) + 1}
+                  isSelected
+                />
               ))}
             </div>
           </div>
@@ -118,7 +129,15 @@ function TabButton({
   );
 }
 
-function TurnCard({ record, turnIndex }: { record: RecordItem; turnIndex: number }) {
+function TurnCard({
+  record,
+  turnIndex,
+  isSelected,
+}: {
+  record: RecordItem;
+  turnIndex: number;
+  isSelected: boolean;
+}) {
   const reqJson = record.req_json || {};
   const messages = Array.isArray((reqJson as { messages?: Message[] }).messages)
     ? ((reqJson as { messages: Message[] }).messages)
@@ -134,7 +153,7 @@ function TurnCard({ record, turnIndex }: { record: RecordItem; turnIndex: number
   ].filter(Boolean);
 
   return (
-    <div className="turn-card">
+    <div id={`turn-${record.id}`} className={`turn-card ${isSelected ? "selected" : ""}`}>
       <div className="turn-head">
         <span className="turn-index">#{turnIndex}</span>
         <span>{record.path}</span>

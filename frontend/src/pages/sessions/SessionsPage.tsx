@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useParams } from "react-router-dom";
 
@@ -8,6 +9,7 @@ import { Sidebar } from "../../widgets/sidebar/Sidebar";
 export function SessionsPage() {
   const navigate = useNavigate();
   const { sessionId } = useParams();
+  const [selectedRecordId, setSelectedRecordId] = useState<string | undefined>(undefined);
 
   const sessionsQuery = useQuery({
     queryKey: ["sessions"],
@@ -26,13 +28,33 @@ export function SessionsPage() {
   });
 
   const sessions = sessionsQuery.data || [];
+  const records = sessionQuery.data?.records || [];
+
+  useEffect(() => {
+    if (!records.length) {
+      setSelectedRecordId(undefined);
+      return;
+    }
+
+    if (!selectedRecordId || !records.some((record) => record.id === selectedRecordId)) {
+      setSelectedRecordId(records[records.length - 1]?.id);
+    }
+  }, [records, selectedRecordId, sessionId]);
+
+  function handleSelectSession(nextSessionId: string) {
+    setSelectedRecordId(undefined);
+    navigate(`/sessions/${nextSessionId}`, { replace: true });
+  }
 
   return (
     <div className="app-shell">
       <Sidebar
         sessions={sessions}
         activeSessionId={sessionId}
-        onSelectSession={(nextSessionId) => navigate(`/sessions/${nextSessionId}`, { replace: true })}
+        activeRecords={records}
+        activeRecordId={selectedRecordId}
+        onSelectSession={handleSelectSession}
+        onSelectRecord={setSelectedRecordId}
       />
 
       <main id="main">
@@ -43,7 +65,7 @@ export function SessionsPage() {
         ) : sessionQuery.isError ? (
           <EmptyState message="会话加载失败" />
         ) : sessionQuery.data ? (
-          <SessionDetail payload={sessionQuery.data} />
+          <SessionDetail payload={sessionQuery.data} selectedRecordId={selectedRecordId} />
         ) : (
           <EmptyState message="未找到该会话" />
         )}
