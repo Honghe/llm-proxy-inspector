@@ -2,24 +2,43 @@
 
 OpenAI-compatible 反向代理 + 请求/响应可视化查看器。
 
+当前版本已拆分为独立前端与后端：
+
+- `backend/` 负责 OpenAI-compatible 反向代理、SSE 转发、sqlite 持久化、会话 API
+- `frontend/` 负责独立 UI 展示，通过 HTTP 调用后端 `/api/*`
+- 前端已改为 `Vite + React + TypeScript + React Router + TanStack Query`
+
 ## 安装
 
 ```bash
 pip install -r requirements.txt
+cd frontend && npm install
 ```
 
 ## 启动
 
 ```bash
-# 默认：上游 http://127.0.0.1:8000，代理 :7654，UI :7655
-python proxy.py
+# 一键同时启动前后端
+./start.sh
 
-# 自定义
-python proxy.py --upstream http://127.0.0.1:8000 --proxy-port 7654 --ui-port 7655
+# 单独启动后端
+python backend/app.py
+python backend/app.py --host 127.0.0.1 --upstream http://127.0.0.1:8000 --proxy-port 7654 --db-path data/proxy.db
 
-# 指定 sqlite 数据文件
-python proxy.py --db-path data/proxy.db
+# 单独构建前端
+cd frontend && npm run build
+
+# 单独启动前端静态服务
+python frontend/server.py --host 127.0.0.1 --port 7655
+
+# 前端开发模式
+cd frontend && npm run dev
 ```
+
+默认端口：
+
+- 后端代理与 API：`http://127.0.0.1:7654`
+- 前端 UI：`http://127.0.0.1:7655`
 
 ## 使用
 
@@ -27,6 +46,7 @@ python proxy.py --db-path data/proxy.db
 - 浏览器打开 `http://<your-host>:7655` 查看请求/响应
 - UI 会自动把连续对话归并成一个 session，按时间线查看每一轮请求/响应
 - 支持显式透传 `x-session-id` / `x-conversation-id` / `x-thread-id` 来强制归组
+- 前端默认会把 API 指向同主机的 `:7654`
 
 ## 截图
 
@@ -64,11 +84,19 @@ python proxy.py --db-path data/proxy.db
 ## 目录结构
 
 ```
-llm-proxy/
-├── proxy.py          # 主程序（代理 + UI 服务）
+llm-proxy-inspector/
+├── backend/
+│   └── app.py        # 后端：代理 + 数据 API
+├── frontend/
+│   ├── src/          # React + TypeScript 源码
+│   ├── dist/         # Vite 构建产物（生成）
+│   ├── package.json
+│   ├── index.html    # Vite 入口模板
+│   └── server.py     # 前端静态服务（托管 dist，支持 SPA fallback）
+├── Dockerfile.backend
+├── Dockerfile.frontend
 ├── requirements.txt
-└── static/
-    └── index.html    # 单文件前端
+└── start.sh
 ```
 
 ## OpenAI SDK 做法

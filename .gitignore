@@ -2,3 +2,8 @@
 .claude/
 __pycache__/
 data/
+.DS_Store
+*.tsbuildinfo
+frontend/vite.config.d.ts
+frontend/node_modules/
+frontend/dist/

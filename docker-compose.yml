@@ -1,19 +1,32 @@
 services:
-  llm-proxy-inspector:
+  llm-proxy-inspector-backend:
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: llm-proxy-inspector
+      dockerfile: Dockerfile.backend
+    container_name: llm-proxy-inspector-backend
     restart: unless-stopped
     ports:
       - "7654:7654"
-      - "7655:7655"
     environment:
       UPSTREAM_BASE: http://host.docker.internal:8080
+      BACKEND_HOST: 0.0.0.0
       PROXY_PORT: "7654"
-      UI_PORT: "7655"
       DB_PATH: /app/data/proxy.db
     volumes:
       - ./data:/app/data
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  llm-proxy-inspector-frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: llm-proxy-inspector-frontend
+    restart: unless-stopped
+    ports:
+      - "7655:7655"
+    environment:
+      FRONTEND_HOST: 0.0.0.0
+      FRONTEND_PORT: "7655"
+    depends_on:
+      - llm-proxy-inspector-backend

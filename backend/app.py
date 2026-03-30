@@ -1,14 +1,13 @@
 """
-LLM Proxy — OpenAI-compatible reverse proxy with request/response inspector
-============================================================================
+LLM Proxy Inspector backend
+===========================
 用法:
-  pip install fastapi uvicorn httpx
-  python proxy.py
-  python proxy.py --upstream http://127.0.0.1:8000 --proxy-port 7654 --ui-port 7655 --max-records 200
+  pip install -r requirements.txt
+  python backend/app.py
+  python backend/app.py --upstream http://127.0.0.1:8000 --proxy-port 7654 --db-path data/proxy.db
 """
 
 import argparse
-import asyncio
 import copy
 import hashlib
 import json
@@ -24,21 +23,21 @@ from typing import Any, AsyncIterator
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
-_parser = argparse.ArgumentParser(description="LLM Proxy Inspector")
+_parser = argparse.ArgumentParser(description="LLM Proxy Inspector Backend")
 _parser.add_argument("--upstream", default=os.getenv("UPSTREAM_BASE", "http://127.0.0.1:8000"))
+_parser.add_argument("--host", default=os.getenv("BACKEND_HOST", "127.0.0.1"))
 _parser.add_argument("--proxy-port", type=int, default=int(os.getenv("PROXY_PORT", "7654")))
-_parser.add_argument("--ui-port", type=int, default=int(os.getenv("UI_PORT", "7655")))
 _parser.add_argument("--max-records", type=int, default=int(os.getenv("MAX_RECORDS", "200")))
 _parser.add_argument("--db-path", default=os.getenv("DB_PATH", "data/proxy.db"))
 _args = _parser.parse_args()
 
 UPSTREAM_BASE = _args.upstream.rstrip("/")
+BACKEND_HOST = _args.host
 PROXY_PORT = _args.proxy_port
-UI_PORT = _args.ui_port
 MAX_RECORDS = _args.max_records
 DB_PATH = Path(_args.db_path)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -101,8 +100,6 @@ def loads_json(value: str | None) -> Any:
         return None
     return json.loads(value)
 
-
-# ── SSE 解析 ──────────────────────────────────────────────────────────────────
 
 def _merge_delta(acc: dict, delta: dict) -> None:
     for key, val in delta.items():
@@ -577,6 +574,22 @@ def summarize_record(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_session_preview(records: list[dict[str, Any]]) -> str:
+    for record in reversed(records):
+        messages = get_messages(record.get("req_json"))
+        if messages:
+            last = messages[-1]
+            content = last.get("content")
+            if isinstance(content, str) and content.strip():
+                return content.strip()[:120]
+            if isinstance(content, list):
+                text_parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
+                joined = " ".join(part for part in text_parts if part).strip()
+                if joined:
+                    return joined[:120]
+    return ""
+
+
 def summarize_session(records: list[dict[str, Any]]) -> dict[str, Any]:
     first = records[0]
     last = records[-1]
@@ -599,22 +612,6 @@ def summarize_session(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def build_session_preview(records: list[dict[str, Any]]) -> str:
-    for record in reversed(records):
-        messages = get_messages(record.get("req_json"))
-        if messages:
-            last = messages[-1]
-            content = last.get("content")
-            if isinstance(content, str) and content.strip():
-                return content.strip()[:120]
-            if isinstance(content, list):
-                text_parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
-                joined = " ".join(part for part in text_parts if part).strip()
-                if joined:
-                    return joined[:120]
-    return ""
-
-
 def list_sessions() -> list[dict[str, Any]]:
     rows = DB.execute("SELECT DISTINCT session_id FROM records").fetchall()
     sessions = []
@@ -626,12 +623,60 @@ def list_sessions() -> list[dict[str, Any]]:
     return sessions
 
 
-# ── Proxy App ─────────────────────────────────────────────────────────────────
+app = FastAPI(title="LLM Proxy Inspector Backend")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["X-Proxy-Record-Id", "X-Proxy-Session-Id"],
+)
 
-proxy_app = FastAPI(title="LLM Proxy")
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 
-@proxy_app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+@app.get("/api/records")
+def api_records():
+    rows = DB.execute("SELECT * FROM records ORDER BY created_at DESC").fetchall()
+    return [summarize_record(row_to_record(row)) for row in rows]
+
+
+@app.get("/api/sessions")
+def api_sessions():
+    return list_sessions()
+
+
+@app.get("/api/sessions/{session_id}")
+def api_session_detail(session_id: str):
+    records = get_session_records(session_id)
+    if not records:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return {
+        "session": summarize_session(records),
+        "records": records,
+    }
+
+
+@app.delete("/api/records")
+def api_clear_records():
+    DB.execute("DELETE FROM records")
+    DB.commit()
+    return {"cleared": True}
+
+
+@app.get("/api/records/{record_id}")
+def api_record_detail(record_id: str):
+    record = get_record(record_id)
+    if not record:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return record
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy(path: str, request: Request):
     url = f"{UPSTREAM_BASE}/{path}"
     headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
@@ -644,7 +689,12 @@ async def proxy(path: str, request: Request):
 
     is_stream = isinstance(req_json, dict) and req_json.get("stream", False)
     record_id = str(uuid.uuid4())
-    session_id, req_messages_sig, req_messages_count = resolve_session_id(f"/{path}", req_json.get("model", "") if isinstance(req_json, dict) else "", req_json, headers)
+    session_id, req_messages_sig, req_messages_count = resolve_session_id(
+        f"/{path}",
+        req_json.get("model", "") if isinstance(req_json, dict) else "",
+        req_json,
+        headers,
+    )
     now = datetime.now()
     base_record = {
         "id": record_id,
@@ -721,11 +771,7 @@ async def proxy(path: str, request: Request):
         )
 
     async with httpx.AsyncClient(timeout=300) as client:
-        try:
-            resp = await client.request(request.method, url, headers=headers, content=body_bytes)
-        except Exception as exc:
-            log.error("✗ %s %s  error=%s", request.method, url, exc)
-            raise
+        resp = await client.request(request.method, url, headers=headers, content=body_bytes)
         latency = round((time.monotonic() - t0) * 1000)
         log.info("← %s %s  status=%s  %dms", request.method, url, resp.status_code, latency)
         try:
@@ -754,72 +800,9 @@ async def proxy(path: str, request: Request):
         )
 
 
-# ── UI App ────────────────────────────────────────────────────────────────────
-
-ui_app = FastAPI(title="LLM Proxy UI")
-
-
-@ui_app.get("/api/records")
-def api_records():
-    rows = DB.execute("SELECT * FROM records ORDER BY created_at DESC").fetchall()
-    return [summarize_record(row_to_record(row)) for row in rows]
-
-
-@ui_app.get("/api/sessions")
-def api_sessions():
-    return list_sessions()
-
-
-@ui_app.get("/api/sessions/{session_id}")
-def api_session_detail(session_id: str):
-    records = get_session_records(session_id)
-    if not records:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    return {
-        "session": summarize_session(records),
-        "records": records,
-    }
-
-
-@ui_app.delete("/api/records")
-def api_clear_records():
-    DB.execute("DELETE FROM records")
-    DB.commit()
-    return {"cleared": True}
-
-
-@ui_app.get("/api/records/{record_id}")
-def api_record_detail(record_id: str):
-    record = get_record(record_id)
-    if not record:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    return record
-
-
-@ui_app.get("/ids/{record_id}")
-@ui_app.get("/sessions/{session_id}")
-@ui_app.get("/")
-def index():
-    return FileResponse("static/index.html")
-
-
-ui_app.mount("/static", StaticFiles(directory="static"), name="static")
-
-
-async def main():
-    cfg_proxy = uvicorn.Config(proxy_app, host="0.0.0.0", port=PROXY_PORT, log_level="warning")
-    cfg_ui = uvicorn.Config(ui_app, host="0.0.0.0", port=UI_PORT, log_level="warning")
-
-    print(f"  Proxy  -> http://0.0.0.0:{PROXY_PORT}  (upstream: {UPSTREAM_BASE})")
-    print(f"  UI     -> http://0.0.0.0:{UI_PORT}")
-    print(f"  DB     -> {DB_PATH}")
-    print()
-
-    await asyncio.gather(
-        uvicorn.Server(cfg_proxy).serve(),
-        uvicorn.Server(cfg_ui).serve(),
-    )
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    print(f"  Backend -> http://{BACKEND_HOST}:{PROXY_PORT}")
+    print(f"  Proxy   -> http://{BACKEND_HOST}:{PROXY_PORT}  (upstream: {UPSTREAM_BASE})")
+    print(f"  DB      -> {DB_PATH}")
+    print()
+    uvicorn.run(app, host=BACKEND_HOST, port=PROXY_PORT, log_level="warning")
