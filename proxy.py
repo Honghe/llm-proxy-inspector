@@ -5,6 +5,7 @@ LLM Proxy — OpenAI-compatible reverse proxy with request/response inspector
   pip install fastapi uvicorn httpx
   python proxy.py
   python proxy.py --upstream http://127.0.0.1:8000 --proxy-port 7654 --ui-port 7655 --max-records 200
+  python proxy.py --think off   # 在每个请求体中注入 chat_template_kwargs.enable_thinking=false
 """
 
 import argparse
@@ -32,12 +33,15 @@ _parser.add_argument("--upstream",    default=os.getenv("UPSTREAM_BASE", "http:/
 _parser.add_argument("--proxy-port",  type=int, default=int(os.getenv("PROXY_PORT", "7654")))
 _parser.add_argument("--ui-port",     type=int, default=int(os.getenv("UI_PORT",    "7655")))
 _parser.add_argument("--max-records", type=int, default=int(os.getenv("MAX_RECORDS","200")))
+_parser.add_argument("--think",       choices=["on", "off"], default="on",
+                     help="当为 off 时在请求体中注入 chat_template_kwargs.enable_thinking=false")
 _args = _parser.parse_args()
 
 UPSTREAM_BASE = _args.upstream.rstrip("/")
 PROXY_PORT    = _args.proxy_port
 UI_PORT       = _args.ui_port
 MAX_RECORDS   = _args.max_records
+THINK         = _args.think  # "on" / "off" / None
 # ──────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
@@ -174,6 +178,15 @@ async def proxy(path: str, request: Request):
         req_json = json.loads(body_bytes) if body_bytes else None
     except Exception:
         req_json = None
+
+    # 当 --think off 时，向请求体注入 chat_template_kwargs.enable_thinking=false
+    if THINK == "off" and isinstance(req_json, dict):
+        ktw = req_json.get("chat_template_kwargs")
+        if not isinstance(ktw, dict):
+            ktw = {}
+        ktw["enable_thinking"] = False
+        req_json["chat_template_kwargs"] = ktw
+        body_bytes = json.dumps(req_json, ensure_ascii=False).encode()
 
     is_stream = isinstance(req_json, dict) and req_json.get("stream", False)
     record_id = str(uuid.uuid4())
