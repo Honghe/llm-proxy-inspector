@@ -15,7 +15,7 @@ pip install -r requirements.txt
 python proxy.py
 
 # 自定义
-python proxy.py --upstream http://127.0.0.1:8000 --proxy-port 7654 --ui-port 7655  --think off
+python proxy.py --upstream http://127.0.0.1:8000 --proxy-port 7654 --ui-port 7655  --think off  --params '{"temperature": 0.7}'
 ```
 
 ## 使用

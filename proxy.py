@@ -1,7 +1,7 @@
 """
 LLM Proxy — OpenAI-compatible reverse proxy with request/response inspector
 ============================================================================
-用法:
+用法：
   pip install fastapi uvicorn httpx
   python proxy.py
   python proxy.py --upstream http://127.0.0.1:8000 --proxy-port 7654 --ui-port 7655 --max-records 200
@@ -35,6 +35,8 @@ _parser.add_argument("--ui-port",     type=int, default=int(os.getenv("UI_PORT",
 _parser.add_argument("--max-records", type=int, default=int(os.getenv("MAX_RECORDS","200")))
 _parser.add_argument("--think",       choices=["on", "off"], default="on",
                      help="当为 off 时在请求体中注入 chat_template_kwargs.enable_thinking=false")
+_parser.add_argument("--params",      default=None, metavar="JSON",
+                     help='启动时注入到每个请求体的参数，JSON 格式，如 \'{"temperature":0.7,"top_p":0.9}\'')
 _args = _parser.parse_args()
 
 UPSTREAM_BASE = _args.upstream.rstrip("/")
@@ -42,6 +44,16 @@ PROXY_PORT    = _args.proxy_port
 UI_PORT       = _args.ui_port
 MAX_RECORDS   = _args.max_records
 THINK         = _args.think  # "on" / "off" / None
+
+# ── 可在运行时动态修改的请求参数覆盖 ──────────────────────────────────────────
+try:
+    _override_params: dict = json.loads(_args.params) if _args.params else {}
+    if not isinstance(_override_params, dict):
+        raise ValueError("--params 必须是 JSON 对象")
+except Exception as e:
+    print(f"[warn] --params 解析失败：{e}，已忽略")
+    _override_params = {}
+_params_lock = Lock()
 # ──────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
@@ -179,6 +191,8 @@ async def proxy(path: str, request: Request):
     except Exception:
         req_json = None
 
+    req_modified = False
+
     # 当 --think off 时，向请求体注入 chat_template_kwargs.enable_thinking=false
     if THINK == "off" and isinstance(req_json, dict):
         ktw = req_json.get("chat_template_kwargs")
@@ -186,6 +200,18 @@ async def proxy(path: str, request: Request):
             ktw = {}
         ktw["enable_thinking"] = False
         req_json["chat_template_kwargs"] = ktw
+        req_modified = True
+
+    # 注入动态参数覆盖（来自 --params）
+    if isinstance(req_json, dict):
+        with _params_lock:
+            cur_params = dict(_override_params)
+        for key, val in cur_params.items():
+            req_json[key] = val
+        if cur_params:
+            req_modified = True
+
+    if req_modified:
         body_bytes = json.dumps(req_json, ensure_ascii=False).encode()
 
     is_stream = isinstance(req_json, dict) and req_json.get("stream", False)
@@ -355,8 +381,13 @@ async def main():
     cfg_proxy = uvicorn.Config(proxy_app, host="0.0.0.0", port=PROXY_PORT, log_level="warning")
     cfg_ui    = uvicorn.Config(ui_app,    host="0.0.0.0", port=UI_PORT,    log_level="warning")
 
-    print(f"  🔀  Proxy  → http://0.0.0.0:{PROXY_PORT}  (upstream: {UPSTREAM_BASE})")
-    print(f"  🔍  UI     → http://0.0.0.0:{UI_PORT}")
+    print(f"Proxy  → http://0.0.0.0:{PROXY_PORT}  (upstream: {UPSTREAM_BASE})")
+    print(f"UI     → http://0.0.0.0:{UI_PORT}")
+    print(f"think  → {THINK}")
+    if _override_params:
+        print(f"params → {json.dumps(_override_params, ensure_ascii=False)}")
+    else:
+        print(f"params → (none)")
     print()
 
     await asyncio.gather(
